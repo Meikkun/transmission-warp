@@ -79,6 +79,9 @@ directories.
 | `DOWNLOADS_DIR` | `/media/HDD2` | Host directory mounted read-write at `/data` |
 | `TRANSMISSION_CONFIG_DIR` | `~/.config/transmission` | Persistent Transmission state |
 | `WARP_DATA_DIR` | `./data` | Private WARP registration and state |
+| `MEDIA_DIR` | `/media` | Host media library mounted read-only at `/media` |
+| `SONARR_CONFIG_DIR` | `~/.config/Sonarr` | Host Sonarr config directory containing `sonarr.db` |
+| `RADARR_CONFIG_DIR` | `~/.config/Radarr` | Host Radarr config directory containing `radarr.db` |
 | `LOCAL_NETWORK` | `192.168.1.0/24` | LAN allowed to reach the Web UI |
 | `HOST_PORT` | `9092` | Host port mapped to Transmission port `9091` |
 | `PUID` / `PGID` | Current user | UID/GID used by Transmission |
@@ -105,9 +108,57 @@ only when all applicable safeguards pass:
 5. Every imported library file recorded by Arr still exists.
 6. Completed-download removal remains enabled for that Arr client.
 
-The Arr databases and `/media` are mounted read-only. Transmission still has
-read-write access to downloads through `/data`; cleanup deletion is requested
-through Transmission's own RPC interface.
+### How Arr monitoring works
+
+The cleaner does not call the Sonarr or Radarr APIs and does not watch their
+directories for changes. Every `ARR_CLEANUP_INTERVAL_SECONDS` seconds, it reads
+both applications' SQLite databases and compares their records with the live
+torrent list returned by Transmission RPC.
+
+When cleanup is enabled, `run.sh` creates these bind mounts:
+
+| Host path | Container path | Access | Used for |
+|---|---|---|---|
+| `SONARR_CONFIG_DIR` | `/arr/sonarr` | Read-only | Reads `sonarr.db` |
+| `RADARR_CONFIG_DIR` | `/arr/radarr` | Read-only | Reads `radarr.db` |
+| `MEDIA_DIR` | `/media` | Read-only | Confirms imported library files still exist |
+| `DOWNLOADS_DIR` | `/data` | Read-write | Transmission's download data |
+
+A bind mount exposes an existing host directory inside the container; it does
+not copy the directory. The `:ro` mount option makes the view read-only, and the
+cleaner also opens each SQLite database with SQLite's read-only mode. It can
+therefore inspect Arr configuration and history, but cannot change Arr settings,
+database records, or media-library files.
+
+For each otherwise eligible torrent, the cleaner:
+
+1. Reads enabled Transmission download clients from both Arr databases.
+2. Keeps only clients pointing to this host's Transmission service with
+   completed-download removal enabled.
+3. Matches the torrent to the client's category/label or download directory.
+4. Looks up the torrent hash and requires its latest matching
+   `DownloadHistory` event to be an import.
+5. Reads every `importedPath` recorded for that hash and confirms each file is
+   visible through the read-only media mount.
+6. Proceeds only when exactly one of Sonarr or Radarr supplies all that
+   evidence.
+7. Repeats the checks immediately before asking Transmission RPC to remove the
+   torrent with its download data.
+
+The cleaner never directly deletes a path. Transmission performs the deletion
+through its own RPC interface; its downloaded payload is on the separately
+mounted read-write `/data` tree, while the imported media library remains
+read-only.
+
+`SONARR_CONFIG_DIR` and `RADARR_CONFIG_DIR` must be host paths, even when Arr
+runs in another container; use the host directories mounted as `/config` in
+those containers. Arr's recorded `importedPath` values must be below `/media`
+inside this container. For example, if Arr records
+`/media/tv/Example/episode.mkv`, then
+`$MEDIA_DIR/tv/Example/episode.mkv` must be the corresponding host file.
+
+Both Arr database directories are currently required when cleanup is enabled.
+Set `ARR_CLEANUP_ENABLED=false` when the guarded cleanup is not needed.
 
 Preview cleanup decisions without deleting anything:
 
@@ -156,4 +207,3 @@ docker logs -f transmission
   design decisions, safeguards, and limitations
 - [Operations guide](docs/OPERATIONS.md) — configuration, verification,
   upgrades, recovery tests, and troubleshooting
-
